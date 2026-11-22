@@ -7,7 +7,13 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
-from locks import release, require_lock
+from lineage_svc import (
+    FORMAL_STATE,
+    batch_lineage_state,
+    insert_formal_inbound_edge,
+    parent_code_of,
+)
+from locks import is_held, release, require_lock
 from models import BatchIn
 from validators import summarize_points, validate_probe_online, validate_temp_point
 
@@ -49,6 +55,8 @@ def list_batches(authorization: AuthHeader = None, status: str | None = None):
         for r in rows:
             d = dict(r)
             d["temp_points"] = json.loads(d["temp_points"] or "[]")
+            # 五页同源：批次页血统字段直接走统一判定，不另立口径
+            d["lineage"] = batch_lineage_state(conn, r)
             items.append(d)
         return {"items": items}
 
@@ -80,15 +88,32 @@ def get_batch(batch_id: int, authorization: AuthHeader = None):
             "batch": data,
             "excursions": [dict(e) for e in exc],
             "seals": [dict(s) for s in seals],
+            "lineage": batch_lineage_state(conn, row),
         }
 
 
 @router.post("/api/batches")
 def create_batch(body: BatchIn, authorization: AuthHeader = None):
     user = require_writer(authorization)
-    lock_key = f"chamber:{body.chamber_id}"
+    chamber_lock = f"chamber:{body.chamber_id}"
+    parent_code = parent_code_of(body.cargo_ref)
+    parent_lock = f"lineage-parent:{parent_code}" if parent_code else None
     with connect() as conn:
-        require_lock(conn, lock_key, user)
+        # 锁序：先仓间锁，后父批锁；后到争用只记痕不写业务
+        chamber_preheld = is_held(conn, chamber_lock, user)
+        require_lock(conn, chamber_lock, user)
+        chamber_acquired = not chamber_preheld
+        parent_acquired = False
+        if parent_lock is not None:
+            parent_preheld = is_held(conn, parent_lock, user)
+            try:
+                require_lock(conn, parent_lock, user)
+                parent_acquired = not parent_preheld
+            except HTTPException:
+                # 争用痕独立提交落库，随后回滚业务事务并拒收
+                conn.commit()
+                _release_if_acquired(conn, chamber_lock, user, chamber_acquired)
+                raise
         try:
             ch = conn.execute(
                 "SELECT * FROM cold_chambers WHERE id=?", (body.chamber_id,)
@@ -121,6 +146,15 @@ def create_batch(body: BatchIn, authorization: AuthHeader = None):
                 "SELECT id FROM temp_batches WHERE batch_code=?", (code,)
             ).fetchone():
                 raise HTTPException(409, "批次编码已存在")
+            # 甲路径：先解析父批，父批不存在则整笔回滚拒收，绝不留孤儿子批
+            parent_row = None
+            if parent_code is not None:
+                parent_row = conn.execute(
+                    "SELECT id, batch_code FROM temp_batches WHERE batch_code=?",
+                    (parent_code,),
+                ).fetchone()
+                if not parent_row:
+                    raise HTTPException(404, f"父批不存在：{parent_code}，整笔回滚拒收")
             status = "已入库" if points else "草稿"
             now = now_iso()
             cur = conn.execute(
@@ -140,29 +174,49 @@ def create_batch(body: BatchIn, authorization: AuthHeader = None):
                     now,
                 ),
             )
-            # BUGFIX-01 埋雷：cargo_ref 形如「父批:CODE」时本应同事务插血缘边，只记审计假绿
-            parent_code = None
-            if body.cargo_ref.startswith("父批:"):
-                parent_code = body.cargo_ref.split(":", 1)[1].strip()
-                # 故意不 INSERT lineage_edges
+            child_id = cur.lastrowid
+            edge_id = None
+            if parent_row is not None:
+                # 同一事务、同一连接、单次 commit：正式边零增完整一笔
+                edge_id = insert_formal_inbound_edge(
+                    conn,
+                    int(parent_row["id"]),
+                    int(child_id),
+                    f"{parent_row['batch_code']} 分装衍生至 {code}",
+                )
             write_audit(
                 conn,
                 user,
                 "batch_inbound",
                 code,
                 {
-                    "batch_id": cur.lastrowid,
+                    "batch_id": child_id,
                     "point_count": len(points),
                     "parent_code": parent_code,
-                    "lineage_ok": True,
+                    "lineage_ok": parent_row is None or edge_id is not None,
+                    "lineage_state": FORMAL_STATE if edge_id is not None else None,
                 },
             )
             conn.commit()
             return {
-                "id": cur.lastrowid,
+                "id": child_id,
                 "batch_code": code,
                 "status": status,
                 "point_count": len(points),
+                "lineage_edge_id": edge_id,
             }
+        except Exception:
+            conn.rollback()
+            raise
         finally:
-            release(conn, lock_key, user)
+            # 只释放本请求新取得的锁，外部预持锁原样保留（逆序释放）
+            _release_if_acquired(conn, parent_lock, user, parent_acquired)
+            _release_if_acquired(conn, chamber_lock, user, chamber_acquired)
+
+
+def _release_if_acquired(conn, lock_key, holder: str, acquired: bool) -> None:
+    if not acquired or lock_key is None:
+        return
+    if is_held(conn, lock_key, holder):
+        release(conn, lock_key, holder)
+        conn.commit()

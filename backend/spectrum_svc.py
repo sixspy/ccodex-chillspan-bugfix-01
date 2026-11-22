@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
+from lineage_svc import batch_lineage_state
 from models import SpectrumIn
 
 router = APIRouter(tags=["spectrum"])
@@ -18,10 +19,22 @@ def list_exports(authorization: AuthHeader = None):
     require_user(authorization)
     with connect() as conn:
         rows = conn.execute(
-            """SELECT s.*, b.batch_code FROM spectrum_exports s
+            """SELECT s.*, b.batch_code, b.id AS b_id, b.cargo_ref AS b_cargo
+               FROM spectrum_exports s
                JOIN temp_batches b ON b.id=s.batch_id ORDER BY s.id DESC"""
         ).fetchall()
-        return {"items": [dict(r) for r in rows]}
+        items = []
+        for r in rows:
+            d = dict(r)
+            # 五页同源：温谱页血统字段走统一判定（Row 同名列需别名还原）
+            lineage = batch_lineage_state(
+                conn, {"id": r["b_id"], "cargo_ref": r["b_cargo"]}
+            )
+            d.pop("b_id", None)
+            d.pop("b_cargo", None)
+            d["lineage"] = lineage
+            items.append(d)
+        return {"items": items}
 
 
 @router.post("/api/spectrum/export")

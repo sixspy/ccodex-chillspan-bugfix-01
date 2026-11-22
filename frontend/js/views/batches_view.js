@@ -19,7 +19,7 @@ export const batchesViewTemplate = `
     <button class="secondary" @click="refresh">刷新</button>
   </div>
   <table class="data-table">
-    <thead><tr><th>批次</th><th>仓间</th><th>探头</th><th>状态</th><th>代</th><th>极值</th><th></th></tr></thead>
+    <thead><tr><th>批次</th><th>仓间</th><th>探头</th><th>状态</th><th>代</th><th>极值</th><th>血统</th><th></th></tr></thead>
     <tbody>
       <tr v-for="b in batches" :key="b.id" @click="selectBatch(b)">
         <td>{{ b.batch_code }}</td>
@@ -28,6 +28,7 @@ export const batchesViewTemplate = `
         <td><span class="badge" :class="statusClass(b.status)">{{ b.status }}</span></td>
         <td>{{ b.generation }}</td>
         <td>{{ fmtTemp(b.min_observed) }} / {{ fmtTemp(b.max_observed) }}</td>
+        <td><span class="badge" :class="b.lineage && b.lineage.lineage_complete ? 'pass' : 'fail'">{{ lineageLabel(b.lineage) }}</span></td>
         <td><button class="mini-btn" @click.stop="loadBatchDetail(b.id)">详情</button></td>
       </tr>
     </tbody>

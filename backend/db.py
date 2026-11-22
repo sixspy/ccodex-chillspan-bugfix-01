@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS lineage_edges(
   to_batch_id INTEGER,
   edge_type TEXT NOT NULL,
   detail TEXT NOT NULL,
+  lineage_state TEXT NOT NULL DEFAULT '正式',
   created_at TEXT NOT NULL,
   FOREIGN KEY(from_batch_id) REFERENCES temp_batches(id)
 );
@@ -398,9 +399,28 @@ def seed_lineage_samples(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_lineage(conn: sqlite3.Connection) -> None:
+    """老库补 lineage_state 列并回填正式态；父子正式边唯一防重。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(lineage_edges)")}
+    if "lineage_state" not in cols:
+        conn.execute(
+            "ALTER TABLE lineage_edges ADD COLUMN lineage_state TEXT NOT NULL DEFAULT '正式'"
+        )
+    conn.execute(
+        """UPDATE lineage_edges SET lineage_state='正式'
+           WHERE lineage_state IS NULL OR lineage_state=''"""
+    )
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS ux_lineage_formal_pair
+           ON lineage_edges(from_batch_id,to_batch_id)
+           WHERE to_batch_id IS NOT NULL AND lineage_state='正式'"""
+    )
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate_lineage(conn)
         seed_users(conn)
         seed_chambers(conn)
         seed_probes(conn)

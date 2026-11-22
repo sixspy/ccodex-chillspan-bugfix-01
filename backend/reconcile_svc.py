@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user
 from db import connect
+from lineage_svc import batch_lineage_state
 
 router = APIRouter(tags=["reconcile"])
 
@@ -22,6 +23,16 @@ def _chamber_recon(conn, chamber) -> dict:
            WHERE chamber_id=? AND status='已封批'""",
         (cid,),
     ).fetchone()["c"]
+    # 五页同源：断链批统计与血缘页共用同一判定，不另立口径
+    batches = conn.execute(
+        "SELECT * FROM temp_batches WHERE chamber_id=? ORDER BY id",
+        (cid,),
+    ).fetchall()
+    broken = [
+        b["batch_code"]
+        for b in batches
+        if not batch_lineage_state(conn, b)["lineage_complete"]
+    ]
     gap = quota - active
     ok = active <= quota
     return {
@@ -33,6 +44,8 @@ def _chamber_recon(conn, chamber) -> dict:
         "sealed_batches": sealed,
         "quota_left": gap,
         "balanced": ok,
+        "lineage_broken_batches": broken,
+        "lineage_broken_count": len(broken),
         "proof": {
             "formula": "active_batches <= quota_batches",
             "left": active,
@@ -48,12 +61,14 @@ def reconcile_all(authorization: AuthHeader = None):
         chambers = conn.execute("SELECT * FROM cold_chambers ORDER BY id").fetchall()
         items = [_chamber_recon(conn, c) for c in chambers]
         bad = [i for i in items if not i["balanced"]]
+        broken_total = sum(i["lineage_broken_count"] for i in items)
         return {
             "items": items,
             "summary": {
                 "total": len(items),
                 "balanced": len(items) - len(bad),
                 "unbalanced": len(bad),
+                "lineage_broken": broken_total,
             },
         }
 
@@ -92,7 +107,9 @@ def batch_proof(batch_code: str, authorization: AuthHeader = None):
         ).fetchone()["c"]
         sealed = batch["status"] == "已封批"
         spectrum_ok = (exports >= 1) if sealed else True
-        # BUGFIX-01 埋雷：血统互证恒绿，掩盖边表空行
+        # 五页同源：血统完整性以 lineage_edges 正式行为唯一真相，禁止恒绿
+        lineage = batch_lineage_state(conn, batch)
+        lineage_ok = lineage["lineage_complete"]
         return {
             "batch_code": batch_code,
             "status": batch["status"],
@@ -102,12 +119,13 @@ def batch_proof(batch_code: str, authorization: AuthHeader = None):
             "sealed": sealed,
             "excursion_closed": open_exc == 0,
             "spectrum_matches_seal": spectrum_ok,
-            "lineage_complete": True,
+            "lineage_complete": lineage_ok,
+            "lineage": lineage,
             "proof": {
                 "formula": "sealed => spectrum>=1 and open_excursions==0",
                 "sealed": sealed,
                 "open_excursions": open_exc,
                 "exports": exports,
-                "lineage_complete": True,
+                "lineage_complete": lineage_ok,
             },
         }

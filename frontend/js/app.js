@@ -152,6 +152,14 @@ createApp({
       if (!t) return "";
       return String(t).slice(0, 48) + (String(t).length > 48 ? "…" : "");
     }
+    // 五页同源：血统标签只解释后端 lineage.lineage_state，不做前端二次判定
+    function lineageLabel(lineage) {
+      if (!lineage) return "—";
+      if (!lineage.lineage_required) return "独立批";
+      return lineage.lineage_complete
+        ? `正式·${lineage.formal_inbound_edges}边`
+        : "断链";
+    }
 
     async function login() {
       err.value = "";
@@ -503,6 +511,7 @@ createApp({
       probeOnlineClass,
       excursionClass,
       shortText,
+      lineageLabel,
       createChamber,
       loadChamberDetail,
       registerProbe,

@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
+from lineage_svc import batch_lineage_state
 from models import ChamberIn
 
 router = APIRouter(tags=["chambers"])
@@ -40,7 +41,7 @@ def get_chamber(chamber_id: int, authorization: AuthHeader = None):
             (chamber_id,),
         ).fetchall()
         batches = conn.execute(
-            """SELECT id,batch_code,status,generation FROM temp_batches
+            """SELECT id,batch_code,status,generation,cargo_ref FROM temp_batches
                WHERE chamber_id=? ORDER BY id DESC LIMIT 20""",
             (chamber_id,),
         ).fetchall()
@@ -49,12 +50,18 @@ def get_chamber(chamber_id: int, authorization: AuthHeader = None):
                WHERE chamber_id=? AND status NOT IN ('已封批','作废')""",
             (chamber_id,),
         ).fetchone()["c"]
+        broken = [
+            b["batch_code"]
+            for b in batches
+            if not batch_lineage_state(conn, b)["lineage_complete"]
+        ]
         return {
             "chamber": dict(ch),
             "probes": [dict(p) for p in probes],
             "recent_batches": [dict(b) for b in batches],
             "active_batch_count": active,
             "quota_left": int(ch["quota_batches"]) - int(active),
+            "lineage_broken_batches": broken,
         }
 
 

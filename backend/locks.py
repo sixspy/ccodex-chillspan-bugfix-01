@@ -43,6 +43,14 @@ def release(conn, lock_key: str, holder: str) -> None:
     )
 
 
+def is_held(conn, lock_key: str, holder: str) -> bool:
+    """锁是否正由该持锁人持有（用于区分本请求新取得与外部预持）。"""
+    row = conn.execute(
+        "SELECT holder FROM chamber_locks WHERE lock_key=?", (lock_key,)
+    ).fetchone()
+    return row is not None and row["holder"] == holder
+
+
 def require_lock(conn, lock_key: str, holder: str) -> None:
     if not try_acquire(conn, lock_key, holder):
         raise HTTPException(409, "争用：后到只记争用，不写业务")
